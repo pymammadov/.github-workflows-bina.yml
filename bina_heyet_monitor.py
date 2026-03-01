@@ -235,7 +235,7 @@ def run_once() -> int:
     delay = float(os.getenv("REQUEST_DELAY_SEC", "1.3"))
     max_azn_per_m2 = float(os.getenv("MAX_AZN_PER_M2", "1000"))
     db_path = os.getenv("DB_PATH", "bina_sent.sqlite3").strip()
-    NOTIFIER: "none"
+    notifier = os.getenv("NOTIFIER", "telegram").strip().lower()  # telegram | none
     keywords_csv = os.getenv("KEYWORDS", "").strip()
     keywords = [k.strip().lower() for k in keywords_csv.split(",") if k.strip()] if keywords_csv else []
 
