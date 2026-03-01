@@ -1,0 +1,47 @@
+name: bina.az heyet monitor
+
+on:
+  schedule:
+    # 06:00 UTC = 10:00 Bakı vaxtı (UTC+4)
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          BINAAZ_LIST_URL: "https://bina.az/baki/alqi-satqi/heyet-evleri"
+          MAX_AZN_PER_M2: "1000"
+          PAGES: "2"
+          REQUEST_DELAY_SEC: "1.6"
+          DB_PATH: "state/bina_sent.sqlite3"
+          NOTIFIER: "telegram"
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python bina_heyet_monitor.py --once
+
+      - name: Save state (commit sqlite)
+        run: |
+          if [ -f state/bina_sent.sqlite3 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state/bina_sent.sqlite3
+            git commit -m "Update sent state" || echo "No changes"
+            git push
+          fi
