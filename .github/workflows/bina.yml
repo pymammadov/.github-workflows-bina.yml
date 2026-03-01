@@ -30,9 +30,7 @@ jobs:
           PAGES: "2"
           REQUEST_DELAY_SEC: "1.6"
           DB_PATH: "state/bina_sent.sqlite3"
-          NOTIFIER: "telegram"
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          NOTIFIER: "none"
         run: python bina_heyet_monitor.py --once
 
       - name: Save state (commit sqlite)
