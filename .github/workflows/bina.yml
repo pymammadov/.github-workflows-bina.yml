@@ -26,7 +26,7 @@ jobs:
       - name: Run monitor
         env:
           BINAAZ_LIST_URL: "https://bina.az/baki/alqi-satqi/heyet-evleri"
-          MAX_AZN_PER_M2: "1000"
+          MAX_AZN_PER_M2: "2000"
           PAGES: "2"
           REQUEST_DELAY_SEC: "1.6"
           DB_PATH: "state/bina_sent.sqlite3"
