@@ -1,331 +1,133 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import time
-import sqlite3
 import argparse
-from dataclasses import dataclass
-from typing import Optional, List, Set, Tuple
-from urllib.parse import urljoin
+import re
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-import requests
-from bs4 import BeautifulSoup
-
-
-BASE_URL_DEFAULT = "https://bina.az/baki/alqi-satqi/heyet-evleri"
-
-UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
-)
-
-HEADERS = {
-    "User-Agent": UA,
-    "Accept-Language": "az,en;q=0.8,ru;q=0.7",
-}
+from dateutil import parser as dtparser
+from playwright.sync_api import sync_playwright
 
 
-@dataclass
-class Listing:
-    listing_id: str
-    url: str
-    title: str
-    price_azn: Optional[float]
-    area_m2: Optional[float]
-    azn_per_m2: Optional[float]
-    location: str
+# Bakı vaxtı (+04:00)
+BAKU_TZ = timezone(timedelta(hours=4))
 
 
-def num_from_text(text: str) -> Optional[float]:
-    if not text:
-        return None
-    s = re.sub(r"[^\d,\.]", "", text)
-    if not s:
-        return None
-    # 12,5 -> 12.5
-    if s.count(",") == 1 and s.count(".") == 0:
-        s = s.replace(",", ".")
-    # 150,000 -> 150000 (if comma used as thousands)
-    if s.count(",") > 1:
-        s = s.replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def extract_id(url: str) -> str:
-    m = re.search(r"(\d{5,})", url)
-    return m.group(1) if m else str(abs(hash(url)))
-
-
-def session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
+def normalize_settlement(raw: str) -> str:
+    s = re.sub(r"\s+", " ", raw).strip()
+    # "q." varsa təmizlə
+    s = re.sub(r"\s*q\.$", "", s, flags=re.IGNORECASE).strip()
     return s
 
 
-def init_db(db_path: str) -> None:
-    con = sqlite3.connect(db_path)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sent (
-            listing_id TEXT PRIMARY KEY,
-            url TEXT NOT NULL,
-            sent_at INTEGER NOT NULL
-        );
-    """)
-    con.commit()
-    con.close()
-
-
-def is_sent(db_path: str, listing_id: str) -> bool:
-    con = sqlite3.connect(db_path)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM sent WHERE listing_id=? LIMIT 1;", (listing_id,))
-    ok = cur.fetchone() is not None
-    con.close()
-    return ok
-
-
-def mark_sent(db_path: str, listing_id: str, url: str) -> None:
-    con = sqlite3.connect(db_path)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO sent(listing_id, url, sent_at) VALUES(?,?,?);",
-        (listing_id, url, int(time.time()))
-    )
-    con.commit()
-    con.close()
-
-
-def fetch_html(s: requests.Session, url: str, timeout: int = 30) -> str:
-    r = s.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.text
-
-
-def parse_list_page_for_item_links(list_html: str, list_url: str) -> List[str]:
+def parse_listing_datetime(text: str) -> Optional[datetime]:
     """
-    Maksimum dayanıqlılıq üçün:
-    - /items/123456 formatlı linkləri tuturuq
-    - həm relative, həm absolute qəbul edirik
+    Bina.az detal səhifəsində tarix formatları dəyişə bilər.
+    Bu funksiya səhifə mətnindən tarix tapmağa çalışır.
     """
-    soup = BeautifulSoup(list_html, "lxml")
-    links: Set[str] = set()
+    # Tipik: "Yeniləndi: 02.03.2026" və ya "02.03.2026, 23:08"
+    m = re.search(r"(\d{2}\.\d{2}\.\d{4})(?:,\s*(\d{2}:\d{2}))?", text)
+    if not m:
+        return None
 
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-
-        # Bina item url pattern: /items/1234567
-        if re.search(r"/items/\d{5,}", href):
-            full = urljoin(list_url, href)
-            links.add(full.split("?")[0].rstrip("/"))
-
-    return sorted(links)
+    date_part = m.group(1)
+    time_part = m.group(2) or "00:00"
+    dt = dtparser.parse(f"{date_part} {time_part}", dayfirst=True)
+    return dt.replace(tzinfo=BAKU_TZ)
 
 
-def parse_item_page(item_html: str, item_url: str) -> Listing:
-    soup = BeautifulSoup(item_html, "lxml")
+def extract_settlement_from_page(text: str) -> Optional[str]:
+    """
+    Breadcrumb / adres bloklarından qəsəbəni tutmağa çalışır.
+    Məs: "Bakı, Xəzər r., Zirə q." -> Zirə
+    """
+    # ən sadə: "Zirə q." kimi hissəni tut
+    m = re.search(r"([A-Za-zƏəÖöÜüĞğÇçŞşİı\- ]+)\s+q\.", text)
+    if m:
+        return normalize_settlement(m.group(1))
 
-    # Title (fallback)
-    title = ""
-    h1 = soup.find("h1")
-    if h1:
-        title = h1.get_text(" ", strip=True)
-    if not title:
-        title = soup.title.get_text(" ", strip=True) if soup.title else "Elan"
-
-    # Location/address (best-effort)
-    location = ""
-    # try common patterns
-    for sel in ["div.product-map__left__address", "div.product-map__left", "div.location", "div.product__title"]:
-        node = soup.select_one(sel)
-        if node:
-            t = node.get_text(" ", strip=True)
-            if t and len(t) <= 120:
-                location = t
-                break
-
-    # ---- Price extraction (best-effort) ----
-    price_azn: Optional[float] = None
-
-    # 1) meta tags sometimes have price
-    for meta_key in [
-        ("property", "product:price:amount"),
-        ("property", "og:price:amount"),
-        ("name", "price"),
-    ]:
-        tag = soup.find("meta", attrs={meta_key[0]: meta_key[1]})
-        if tag and tag.get("content"):
-            price_azn = num_from_text(tag["content"])
-            if price_azn:
-                break
-
-    # 2) visible price text (₼ / AZN)
-    if price_azn is None:
-        text = soup.get_text(" ", strip=True)
-        m = re.search(r"(\d[\d\s]{2,})\s*(AZN|₼)", text)
-        if m:
-            price_azn = num_from_text(m.group(1))
-
-    # ---- Area extraction (m²) ----
-    area_m2: Optional[float] = None
-    text = soup.get_text(" ", strip=True)
-
-    # Prefer patterns around "Sahə/Sahəsi"
-    m_area = re.search(r"(Sah[əəsi]*\s*[:\-]?\s*)(\d+(?:[.,]\d+)?)\s*(m2|m²)", text, re.IGNORECASE)
-    if m_area:
-        area_m2 = num_from_text(m_area.group(2))
-
-    # Fallback: first plausible m² mention
-    if area_m2 is None:
-        m2 = re.search(r"(\d+(?:[.,]\d+)?)\s*(m2|m²)", text, re.IGNORECASE)
-        if m2:
-            area_m2 = num_from_text(m2.group(1))
-
-    azn_per_m2 = None
-    if price_azn and area_m2 and area_m2 > 0:
-        azn_per_m2 = price_azn / area_m2
-
-    return Listing(
-        listing_id=extract_id(item_url),
-        url=item_url,
-        title=title,
-        price_azn=price_azn,
-        area_m2=area_m2,
-        azn_per_m2=azn_per_m2,
-        location=location
-    )
+    # alternativ: "Zirə" tək də qala bilər — ehtiyac olarsa genişləndir
+    return None
 
 
-def build_message(items: List[Listing], limit: int = 10) -> str:
-    items = items[:limit]
-    lines = [f"Bina.az (həyət evi): {len(items)} yeni elan ≤ 1000 AZN/m²"]
-    for i, it in enumerate(items, 1):
-        p = f"{int(it.price_azn):,}".replace(",", " ") if it.price_azn else "?"
-        a = f"{it.area_m2:g}" if it.area_m2 else "?"
-        pm2 = f"{it.azn_per_m2:.0f}" if it.azn_per_m2 else "?"
-        loc = f" | {it.location}" if it.location else ""
-        lines.append(f"{i}) {pm2} AZN/m² | {p} AZN | {a} m²{loc}\n{it.url}")
-    return "\n\n".join(lines)
+def run_scan(start_url: str, pages_to_scan: int, wait_ms: int, lookback_days: int) -> None:
+    now = datetime.now(tz=BAKU_TZ)
+    since = now - timedelta(days=lookback_days)
 
+    settlement_counts: Counter[str] = Counter()
+    scanned = 0
+    kept = 0
 
-def send_telegram(message: str) -> None:
-    token = os.getenv("TG_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TG_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        raise RuntimeError("Telegram üçün TG_BOT_TOKEN və TG_CHAT_ID lazımdır.")
-    api = f"https://api.telegram.org/bot{token}/sendMessage"
-    r = requests.post(api, json={
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True
-    }, timeout=30)
-    r.raise_for_status()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
 
+        for i in range(1, pages_to_scan + 1):
+            url = f"{start_url}&page={i}"
+            page.goto(url, wait_until="networkidle")
+            page.wait_for_timeout(wait_ms)
 
-def run_once() -> int:
-    list_url = os.getenv("BINAAZ_LIST_URL", BASE_URL_DEFAULT).strip()
-    pages = int(os.getenv("PAGES", "3"))
-    delay = float(os.getenv("REQUEST_DELAY_SEC", "1.3"))
-    max_azn_per_m2 = float(os.getenv("MAX_AZN_PER_M2", "1000"))
-    db_path = os.getenv("DB_PATH", "bina_sent.sqlite3").strip()
-    notifier = os.getenv("NOTIFIER", "telegram").strip().lower()  # telegram | none
-    keywords_csv = os.getenv("KEYWORDS", "").strip()
-    keywords = [k.strip().lower() for k in keywords_csv.split(",") if k.strip()] if keywords_csv else []
+            # siyahıdan item linklərini götür
+            links = page.eval_on_selector_all(
+                "a[href^='/items/']",
+                "els => Array.from(new Set(els.map(e => e.href)))",
+            )
 
-    init_db(db_path)
+            for link in links:
+                scanned += 1
+                page.goto(link, wait_until="networkidle")
+                page.wait_for_timeout(800)
 
-    s = session()
+                txt = page.inner_text("body")
 
-    all_item_links: List[str] = []
-    for page in range(1, pages + 1):
-        page_url = list_url
-        # Bina.az pagination parametrləri dəyişə bilər; bu fallback üsuldur:
-        # çox vaxt ?page=2 kimi işləyir. İşləməsə, sadəcə 1-ci səhifəni oxuyacaq.
-        if page > 1:
-            join_char = "&" if "?" in page_url else "?"
-            page_url = f"{page_url}{join_char}page={page}"
-
-        html = fetch_html(s, page_url)
-        links = parse_list_page_for_item_links(html, page_url)
-        all_item_links.extend(links)
-        time.sleep(delay)
-
-    # unique, keep order-ish
-    seen = set()
-    item_links = []
-    for u in all_item_links:
-        if u not in seen:
-            seen.add(u)
-            item_links.append(u)
-
-    matches: List[Listing] = []
-
-    for u in item_links:
-        lid = extract_id(u)
-        # artıq göndərilibsə, keç
-        if is_sent(db_path, lid):
-            continue
-
-        try:
-            item_html = fetch_html(s, u)
-        except Exception:
-            continue
-
-        it = parse_item_page(item_html, u)
-
-        # Filtr: qiymət və sahə mütləq olsun
-        if it.azn_per_m2 is None:
-            time.sleep(delay)
-            continue
-
-        if it.azn_per_m2 <= max_azn_per_m2:
-            if keywords:
-                hay = (it.title + " " + it.location + " " + it.url).lower()
-                if not any(k in hay for k in keywords):
-                    time.sleep(delay)
+                dt = parse_listing_datetime(txt)
+                if not dt or dt < since:
                     continue
-            matches.append(it)
 
-        time.sleep(delay)
+                settlement = extract_settlement_from_page(txt)
+                if not settlement:
+                    continue
 
-    if not matches:
-        return 0
+                settlement_counts[settlement] += 1
+                kept += 1
 
-    # ən ucuz AZN/m² əvvəl
-    matches.sort(key=lambda x: x.azn_per_m2 if x.azn_per_m2 is not None else 10**18)
+            print(
+                f"Scanned list page {i}: total detail pages visited so far={scanned}, "
+                f"kept(last{lookback_days}d)={kept}"
+            )
 
-    msg = build_message(matches)
+        browser.close()
 
-    if notifier == "telegram":
-        send_telegram(msg)
-    elif notifier == "none":
-        print(msg)
-    else:
-        raise RuntimeError("NOTIFIER yalnız 'telegram' və ya 'none' ola bilər.")
+    total = sum(settlement_counts.values())
+    print(f"\n=== TOP qəsəbələr (son {lookback_days} gün) ===")
+    for name, count in settlement_counts.most_common(20):
+        pct = (count / total * 100) if total else 0
+        print(f"{name:20s}  {count:4d}  ({pct:5.1f}%)")
 
-    for it in matches:
-        mark_sent(db_path, it.listing_id, it.url)
-
-    return len(matches)
+    print(f"\nTOTAL counted (last {lookback_days} days): {total}")
+    print(f"Since: {since.isoformat()}  To: {now.isoformat()}")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="Bir dəfə yoxla və çıx.")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Bina.az qəsəbə trend analizeri (son N gün).")
+    ap.add_argument(
+        "--start-url",
+        default="https://bina.az/baki/alqi-satqi/heyet-evleri?items_view=list",
+        help="Siyahı URL-i",
+    )
+    ap.add_argument("--pages", type=int, default=50, help="Skan ediləcək səhifə sayı")
+    ap.add_argument("--wait-ms", type=int, default=2000, help="Siyahı səhifəsi gözləmə vaxtı (ms)")
+    ap.add_argument("--days", type=int, default=14, help="Neçə günə baxılsın")
     args = ap.parse_args()
 
-    if args.once:
-        n = run_once()
-        print(f"Sent: {n}")
-    else:
-        ap.print_help()
+    run_scan(
+        start_url=args.start_url,
+        pages_to_scan=args.pages,
+        wait_ms=args.wait_ms,
+        lookback_days=args.days,
+    )
 
 
 if __name__ == "__main__":
