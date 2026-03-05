@@ -68,6 +68,9 @@ def session() -> requests.Session:
 
 
 def init_db(db_path: str) -> None:
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     con = sqlite3.connect(db_path)
     cur = con.cursor()
     cur.execute("""
@@ -234,7 +237,7 @@ def run_once() -> int:
     pages = int(os.getenv("PAGES", "3"))
     delay = float(os.getenv("REQUEST_DELAY_SEC", "1.3"))
     max_azn_per_m2 = float(os.getenv("MAX_AZN_PER_M2", "1000"))
-    db_path = os.getenv("DB_PATH", "bina_sent.sqlite3").strip()
+    db_path = os.getenv("DB_PATH", "state/bina_sent.sqlite3").strip()
     notifier = os.getenv("NOTIFIER", "telegram").strip().lower()  # telegram | none
     keywords_csv = os.getenv("KEYWORDS", "").strip()
     keywords = [k.strip().lower() for k in keywords_csv.split(",") if k.strip()] if keywords_csv else []
